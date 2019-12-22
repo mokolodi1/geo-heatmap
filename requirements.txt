@@ -3,3 +3,4 @@ folium
 progressbar2
 argparse
 ijson
+PyGeodesy

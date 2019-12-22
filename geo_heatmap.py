@@ -14,6 +14,7 @@ import webbrowser
 from xml.etree import ElementTree
 from xml.dom import minidom
 import zipfile
+from pygeodesy.sphericalTrigonometry import LatLon
 
 
 class Generator:
@@ -21,6 +22,8 @@ class Generator:
         self.coordinates = collections.defaultdict(int)
         self.max_coordinates = (0, 0)
         self.max_magnitude = 0
+
+        self.flight_coordinates = []
 
     def loadJSONData(self, json_file, date_range):
         """Loads the Google location data from the given json file.
@@ -46,7 +49,7 @@ class Generator:
 
     def streamJSONData(self, json_file, date_range):
         """Stream the Google location data from the given json file.
-        
+
         Arguments:
             json_file {file} -- An open file-like object with JSON-encoded
                 Google location data.
@@ -56,7 +59,7 @@ class Generator:
         # Estimate location amount
         max_value_est = sum(1 for line in json_file) / 13
         json_file.seek(0)
-        
+
         locations = ijson.items(json_file, "locations.item")
         w = [Bar(), Percentage(), " ", ETA()]
         with ProgressBar(max_value=max_value_est, widgets=w) as pb:
@@ -68,7 +71,7 @@ class Generator:
 
                 if timestampInRange(loc['timestampMs'], date_range):
                     self.updateCoord(coords)
-                    
+
                 if i > max_value_est:
                     max_value_est = i
                     pb.max_value = i
@@ -97,7 +100,61 @@ class Generator:
                     self.updateCoord(coords)
                 pb.update(i)
 
+    def loadFlightsData(self, flights_path, date_range):
+        """Loads the Google semantic location data from the given folder.
+
+        Arguments:
+            flights_path {string} -- Semantic Location History folder from
+                Google Takeout Zip archive.
+            date_range {tuple} -- A tuple containing the min-date and max-date.
+                e.g.: (None, None), (None, '2019-01-01'), ('2017-02-11'), ('2019-01-01')
+        """
+        for year_folder in os.listdir(flights_path):
+            year_path = os.path.join(flights_path, year_folder)
+            if not os.path.isdir(year_path):
+                continue
+
+            for month_file in os.listdir(year_path):
+                if not month_file.endswith(".json"):
+                    continue
+
+                month_path = os.path.join(year_path, month_file)
+                with open(month_path) as json_file:
+                    data = json.load(json_file)
+                    if "timelineObjects" not in data:
+                        continue
+
+                    for i, loc in enumerate(data["timelineObjects"]):
+                        if "activitySegment" not in loc:
+                            continue
+
+                        segment = loc["activitySegment"]
+                        if "activityType" not in segment or \
+                                "confidence" not in segment:
+                            continue
+
+                        start_timestamp = segment["duration"]["startTimestampMs"]
+                        if segment["activityType"] != "FLYING" or \
+                                not (segment["confidence"] == "HIGH" or \
+                                     segment["confidence"] == "MEDIUM") or \
+                                not timestampInRange(start_timestamp, date_range):
+                            continue
+
+                        start = segment["startLocation"]
+                        end = segment["endLocation"]
+
+                        start = LatLon(start["latitudeE7"] / 1e7, start["longitudeE7"] / 1e7)
+                        end = LatLon(end["latitudeE7"] / 1e7, end["longitudeE7"] / 1e7)
+
+                        intermediates = []
+                        for i in range(0, 101):
+                            location = start.intermediateTo(end, i / 100.0)
+                            intermediates.append([location.lat, location.lon ])
+
+                        self.flight_coordinates.append(intermediates)
+
     def loadZIPData(self, file_name, date_range):
+        # TODO: need to make this work for the flights setting
         """
         Load Google location data from a "takeout-*.zip" file.
         """
@@ -146,7 +203,7 @@ class Generator:
                     for coords, magnitude in self.coordinates.items()]
 
         # Generate map
-        m = folium.Map(location=self.max_coordinates,
+        map = folium.Map(location=self.max_coordinates,
                        zoom_start=map_zoom_start,
                        tiles=tiles)
 
@@ -158,21 +215,28 @@ class Generator:
                           blur=heatmap_blur,
                           max_zoom=heatmap_max_zoom)
 
-        m.add_child(heatmap)
-        return m
+        map.add_child(heatmap)
 
-    def run(self, data_files, output_file, date_range, stream_data, tiles):
+        for flight_coordinate in self.flight_coordinates:
+            line = folium.PolyLine(flight_coordinate, color="green", weight=2.5, opacity=.25)
+            line.add_to(map)
+
+        return map
+
+    def run(self, data_files, output_file, date_range, stream_data, tiles, flights_path):
         """Load the data, generate the heatmap and save it.
 
         Arguments:
             data_files {list} -- List of names of the data files with the Google
-                location data or the Google takeout ZIP archive.
+                location data or the Google Takeout ZIP archive.
             output_file {string} -- The name of the output file.
+            flights_path {string} -- Semantic Location History folder from
+                Google Takeout Zip archive.
         """
         for i, data_file in enumerate(data_files):
             print("\n({}/{}) Loading data from {}".format(
-                i + 1, 
-                len(data_files) + 2, 
+                i + 1,
+                len(data_files) + 2,
                 data_file))
             if data_file.endswith(".zip"):
                 self.loadZIPData(data_file, date_range)
@@ -187,16 +251,24 @@ class Generator:
             else:
                 raise NotImplementedError(
                     "Unsupported file extension for {!r}".format(data_file))
-                
+
+        total_steps = len(data_files) + 2
+        if flights_path is not None:
+            total_steps += 1
+            print("\n({}/{}) Loading flights data".format(
+                total_steps - 2,
+                total_steps))
+            self.loadFlightsData(flights_path, date_range)
+
         print("\n({}/{}) Generating heatmap".format(
-            len(data_files) + 1, 
-            len(data_files) + 2))
-        m = self.generateMap(tiles)
+            total_steps - 1,
+            total_steps))
+        map = self.generateMap(tiles)
         print("\n({}/{}) Saving map to {}\n".format(
-            len(data_files) + 2,
-            len(data_files) + 2,
+            total_steps,
+            total_steps,
             output_file))
-        m.save(output_file)
+        map.save(output_file)
 
 
 if __name__ == "__main__":
@@ -216,6 +288,9 @@ if __name__ == "__main__":
     parser.add_argument("--map", "-m", dest="map", metavar="MAP", type=str, required=False, default="OpenStreetMap",
                         help="The name of the map tiles you want to use.\n" \
                         "(e.g. 'OpenStreetMap', 'StamenTerrain', 'StamenToner', 'StamenWatercolor')")
+    parser.add_argument("-f", "--flights", dest="flights_path", metavar="", type=str, required=False,
+                        help="Path of semantic location history folder " \
+                        "(e.g. ./Takeout/Location\ History/Semantic\ Location\ History/)")
 
     args = parser.parse_args()
     data_file = args.files
@@ -223,9 +298,10 @@ if __name__ == "__main__":
     date_range = args.min_date, args.max_date
     tiles = args.map
     stream_data = args.stream
+    flights_path = args.flights_path
 
     generator = Generator()
-    generator.run(data_file, output_file, date_range, stream_data, tiles)
+    generator.run(data_file, output_file, date_range, stream_data, tiles, flights_path)
     # Check if browser is text-based
     if not isTextBasedBrowser(webbrowser.get()):
         try:
